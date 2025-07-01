@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-from .parallel import parallel_kernel_path_attention
+from .parallel import triton_kernel_path_attn
 
 __all__ = [
-    'parallel_kernel_path_attention'
+    'triton_kernel_path_attn'
 ]
