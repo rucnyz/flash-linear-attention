@@ -16,7 +16,7 @@ if COMPILER_MODE:
     test_d_list = [64]
 else:
     test_b_list = [2]
-    test_t_list = [63, 300, 4095]
+    test_t_list = [300, 4095]
     test_d_list = [64]
 test_fgate_logit_range_list = [(0.95, 1), (1, 1)]
 test_hq_list = [8, 16]

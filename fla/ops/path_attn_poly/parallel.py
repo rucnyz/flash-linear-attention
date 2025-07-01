@@ -14,9 +14,12 @@ from fla.ops.path_attn_poly.cumprod_householder_bwd import chunk_cumprod_househo
 from fla.ops.path_attn_poly.cumprod_householder_fwd import chunk_cumprod_householder_fwd_fn
 from fla.ops.path_attn_poly.intra_chunk_preprocess_bwd import intra_chunk_preprocess_bwd_fn
 from fla.ops.path_attn_poly.intra_chunk_preprocess_bwd_prepare import intra_chunk_preprocess_bwd_prepare_fn
+from fla.ops.path_attn_poly.intra_chunk_preprocess_fwd import intra_chunk_preprocess_fwd_fn
 from fla.ops.path_attn_poly.parallel_path_bwd_inter_dkv import parallel_path_bwd_dkv_fn
 from fla.ops.path_attn_poly.parallel_path_bwd_inter_dqh import parallel_path_bwd_dq_fn
 from fla.ops.path_attn_poly.parallel_path_bwd_intra import parallel_path_bwd_intra_chunk_fn
+from fla.ops.path_attn_poly.parallel_path_fwd import parallel_path_fwd_fn
+from fla.ops.path_attn_poly.prepare_k_cache import prepare_k_cache_fn
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cumsum import chunk_global_cumsum
 from fla.ops.utils.solve_tril import solve_tril
@@ -131,7 +134,7 @@ def chunk_qk_matmul_fwd(
     )
     return out
 
-class ParallelKernelPATHAttentionFunction(torch.autograd.Function):
+class ParallelKernelFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -142,6 +145,7 @@ class ParallelKernelPATHAttentionFunction(torch.autograd.Function):
             else None
         )
         BS = 64
+        BT = 64
         A = chunk_scaled_dot_kkt_fwd(
             k=k.transpose(2, 1),
             beta=torch.ones_like(beta).transpose(2, 1),
@@ -161,51 +165,49 @@ class ParallelKernelPATHAttentionFunction(torch.autograd.Function):
         )
         # triangular value of A2
         A2 = solve_tril(A=A2, cu_seqlens=cu_seqlens, output_dtype=k2.dtype)
-        A3 = chunk_qk_matmul_fwd(
-            q=q.transpose(2, 1),
-            k=k.transpose(2, 1),
-            q2=q2.transpose(2, 1),
-            k2=k2.transpose(2, 1),
-            A=A,
-            A2=A2,
-            cu_seqlens=cu_seqlens,
-            chunk_size=BS,
-            output_dtype=torch.float32,
-        )
 
-        # q_new, k_new, h, o, L, M = intra_chunk_preprocess_fwd_fn(
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     w=w,
-        #     beta=beta,
-        #     g_cumsum=g_cumsum,
-        #     A=A,
-        #     scale=scale,
-        #     BT=BS,
-        #     cu_seqlens=cu_seqlens,
-        # )
-        # o, L = parallel_path_fwd_fn(
-        #     q=q_new,
-        #     k=k_new,
-        #     v=v,
-        #     L=L,
-        #     h=h,
-        #     M=M,
-        #     o=o,
-        #     g_cumsum=g_cumsum,
-        #     scale=scale,
-        #     cu_seqlens=cu_seqlens,
-        #     BT=BT,
-        #     BS=BS,
-        # )
-        # k_cache = prepare_k_cache_fn(
-        #     k=k_new, h=h, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache
-        # )
-        # ctx.save_for_backward(q, k, q2, k2, v, g_cumsum, o, beta, L)
+        q_new, k_new, h, o = intra_chunk_preprocess_fwd_fn(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            A=A,
+            scale=scale,
+            BT=BS,
+            cu_seqlens=cu_seqlens,
+        )
+        q_new2, k_new2, h2, o2 = intra_chunk_preprocess_fwd_fn(
+            q=q2,
+            k=k2,
+            v=v,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            A=A2,
+            scale=scale,
+            BT=BS,
+            cu_seqlens=cu_seqlens,
+        )
+        o = parallel_path_fwd_fn(
+            q=q_new,
+            q2=q_new2,
+            k=k_new,
+            k2=k_new2,
+            v=v,
+            h=h,
+            h2=h2,
+            o=o,
+            g_cumsum=g_cumsum,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            BT=BT,
+            BS=BS,
+        )
+        k_cache = prepare_k_cache_fn(k=k_new, h=h, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache)
+        ctx.save_for_backward(q, k, v, g_cumsum, o, beta)
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
-        return None
+        return o, k_cache
 
     @staticmethod
     @input_guard
@@ -351,7 +353,7 @@ class ParallelKernelPATHAttentionFunction(torch.autograd.Function):
 
 
 @torch.compiler.disable
-def parallel_kernel_path_attention(
+def triton_kernel_path_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     q2: torch.Tensor,
@@ -365,6 +367,10 @@ def parallel_kernel_path_attention(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
+        q2: (torch.Tensor):
+            queries of shape `[B, T, HQ, K]`
+        k2 (torch.Tensor):
+            keys of shape `[B, T, H, K]`
         q (torch.Tensor):
             queries of shape `[B, T, HQ, K]`
         k (torch.Tensor):
@@ -406,7 +412,7 @@ def parallel_kernel_path_attention(
     assert q.shape[-2] % k.shape[-2] == 0, (
         "the number of query heads should be divisible by the number of key heads"
     )
-    o, k_cache = ParallelKernelPATHAttentionFunction.apply(
+    o, k_cache = ParallelKernelFunction.apply(
         q, k, q2, k2, v, beta, g, scale, cu_seqlens, use_cache
     )
     return o, k_cache
