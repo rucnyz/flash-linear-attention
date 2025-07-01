@@ -52,7 +52,7 @@ def parallel_path_fwd_kernel(
         b_g_cumsum_q = tl.load(p_g_cumsum_q, boundary_check=(0,))
     else:
         b_g_cumsum_q = None
-
+    # 类内更新：第一个不需要qH是因为对角线上的H已经在k上更新了
     for offset in range((i_t + 1) * BT - 2 * BS, i_t*BT-BS, -BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, K*H), (0, offset), (BK, BS), (0, 1))  # GQA when H!=HQ
         p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (V*H, 1), (offset, 0), (BS, BV), (1, 0))  # GQA when H!=HQ
@@ -87,7 +87,7 @@ def parallel_path_fwd_kernel(
         b_q -= tl.dot(b_s2.to(b_w2.dtype), b_w2)
 
     tl.debug_barrier()
-
+    # 类间更新
     for offset in range(i_t * BT - BS, -BS, -BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, K*H), (0, offset), (BK, BS), (0, 1))  # GQA when H!=HQ
         p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (V*H, 1), (offset, 0), (BS, BV), (1, 0))  # GQA when H!=HQ
